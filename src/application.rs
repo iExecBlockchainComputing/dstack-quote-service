@@ -9,6 +9,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::handlers;
+use crate::instance_file;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -52,7 +53,34 @@ impl Application {
             .layer(cors)
     }
 
+    /// Writes the instance file, when enabled, before the listener is bound.
+    ///
+    /// Doing it first means that a successful `/health` response also guarantees
+    /// the file is on disk, so consumers can simply wait for the container to be
+    /// healthy.
+    async fn write_instance_file(&self) -> Result<()> {
+        let cfg = &self.config.instance_file;
+        if !cfg.enabled {
+            debug!("Instance file disabled, skipping");
+            return Ok(());
+        }
+
+        match instance_file::write(&self.state.dstack_client, cfg).await {
+            Ok(()) => {
+                info!("Instance file written to {}", cfg.path.display());
+                Ok(())
+            }
+            Err(e) if cfg.required => Err(e.context("Failed to write the required instance file")),
+            Err(e) => {
+                warn!("Failed to write the instance file, continuing anyway: {e:#}");
+                Ok(())
+            }
+        }
+    }
+
     pub async fn run(self) -> Result<()> {
+        self.write_instance_file().await?;
+
         let addr = self.config.bind_addr();
         let app = self.build_router();
         let listener = tokio::net::TcpListener::bind(&addr)

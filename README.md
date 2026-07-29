@@ -35,7 +35,7 @@ The service can be configured using environment variables. The naming scheme is
 | `QUOTE_SIDECAR_SERVER__HOST`                 | Server bind address                                | `0.0.0.0`             |
 | `QUOTE_SIDECAR_SERVER__PORT`                 | Server port                                        | `9999`                |
 | `QUOTE_SIDECAR_INSTANCE_FILE__ENABLED`       | Write the instance file at startup                 | `false`               |
-| `QUOTE_SIDECAR_INSTANCE_FILE__PATH`          | Destination of the instance file                   | `/shared/instance.env`|
+| `QUOTE_SIDECAR_INSTANCE_FILE__PATH`          | Destination of the instance file                   | `/shared/instance.conf`|
 | `QUOTE_SIDECAR_INSTANCE_FILE__REQUIRED`      | Abort startup if the instance file cannot be written | `true`              |
 | `QUOTE_SIDECAR_INSTANCE_FILE__RETRIES`       | Extra attempts to reach the guest agent            | `5`                   |
 | `QUOTE_SIDECAR_INSTANCE_FILE__RETRY_DELAY_MS`| Delay between two attempts, in milliseconds        | `2000`                |
@@ -202,20 +202,25 @@ dstack-quote-sidecar/
 
 ## Instance File
 
-Log shippers running alongside this service inside the CVM — Fluent Bit, typically — need the
-dstack `instance_id` to label the records they forward. Rather than giving each of them its own
-access to the dstack socket (which usually means an extra `curl` + `jq` init container), this
-service can persist the CVM identity once at startup.
+Fluent Bit, running alongside this service inside the CVM, needs the dstack `instance_id` to
+label the records it forwards. Rather than giving it its own access to the dstack socket (which
+usually means an extra `curl` + `jq` init container), this service can persist the CVM identity
+once at startup.
 
-Enable it with `QUOTE_SIDECAR_INSTANCE_FILE__ENABLED=true`. The service then queries the guest
-agent and writes a shell-sourceable file:
+Enable it with `QUOTE_SIDECAR_INSTANCE_FILE__ENABLED=true`. The service queries the guest agent
+and writes a Fluent Bit configuration fragment:
 
-```sh
-INSTANCE_ID='...'
-APP_ID='...'
-APP_NAME='...'
-COMPOSE_HASH='...'
+```ini
+@SET INSTANCE_ID=...
+@SET APP_ID=...
+@SET APP_NAME=...
+@SET COMPOSE_HASH=...
 ```
+
+Fluent Bit pulls it in with an `@INCLUDE` and the values become usable as `${INSTANCE_ID}` and
+friends anywhere in its configuration. `@SET` is used rather than an `.env` file because the
+official Fluent Bit images are **distroless** — no `sh`, no `bash`, no `busybox` — so overriding
+their entrypoint to `source` a file is not possible.
 
 Properties worth knowing:
 
@@ -228,16 +233,20 @@ Properties worth knowing:
 - **Fail-fast by default.** If the file cannot be written, startup aborts with a non-zero exit
   code. This is what keeps the guarantee above meaningful: a healthy container always has a
   fresh file.
-- Values are single-quoted and escaped, so they are safe to `source` from a POSIX shell.
+- Values are written bare, because `@SET` takes everything up to the end of the line literally.
+  A value containing a newline is rejected at write time rather than producing a stray
+  configuration line.
 - `app_cert` and `tcb_info` are deliberately **not** exported. Use `GET /info` for the full payload.
 
 > **Careful with `REQUIRED=false`.** It downgrades a write failure to a warning and lets the
-> service start, which breaks the healthy-implies-written guarantee in two ways: consumers that
-> `source` the file will fail on a missing file, and if a file from a previous boot is still on
-> the volume they will silently label their records with a **stale** `instance_id`. Only use it
-> when serving quotes matters more than labelling logs correctly.
+> service start, which breaks the healthy-implies-written guarantee in two ways: Fluent Bit
+> refuses to start on a missing `@INCLUDE` target, and if a file from a previous boot is still on
+> the volume it will silently label its records with a **stale** `instance_id`. Only use it when
+> serving quotes matters more than labelling logs correctly.
 
 ### Fluent Bit integration
+
+No entrypoint override, no extra container: mount the shared volume and include the fragment.
 
 ```yaml
 services:
@@ -245,21 +254,16 @@ services:
     image: docker-regis.iex.ec/dstack-quote-service:<tag>
     environment:
       QUOTE_SIDECAR_INSTANCE_FILE__ENABLED: "true"
-      QUOTE_SIDECAR_INSTANCE_FILE__PATH: /shared/instance.env
+      QUOTE_SIDECAR_INSTANCE_FILE__PATH: /shared/instance.conf
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
       - shared:/shared
 
-  fluentbit:
-    image: fluent/fluent-bit:latest
+  fluent-bit:
+    image: fluent/fluent-bit:<tag>
     depends_on:
       dstack-quote-service:
         condition: service_healthy
-    entrypoint: ["sh", "-c"]
-    command:
-      - . /shared/instance.env
-        && export INSTANCE_ID APP_ID APP_NAME COMPOSE_HASH
-        && exec /fluent-bit/bin/fluent-bit -c /fluent-bit/etc/fluent-bit.conf
     volumes:
       - shared:/shared
       - ./fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf
@@ -268,15 +272,28 @@ volumes:
   shared:
 ```
 
-The values are then usable in `fluent-bit.conf`:
+`fluent-bit.conf` includes the fragment first, then uses the values anywhere:
 
 ```ini
+@INCLUDE /shared/instance.conf
+
 [FILTER]
     Name          record_modifier
     Match         *
     Record        instance_id ${INSTANCE_ID}
     Record        app_name    ${APP_NAME}
 ```
+
+Fluent Bit refuses to start if the `@INCLUDE` target is missing, which is the behaviour you want:
+combined with `condition: service_healthy` it enforces ordering at `compose up`, and if the
+daemon restarts containers out of order (after a host reboot, say) Fluent Bit simply retries
+until the file is there rather than shipping unlabelled records.
+
+> **If the configuration lives in a compose `configs: content:` block, escape the variable as
+> `$${INSTANCE_ID}`.** Compose interpolates `${...}` in that block at `up` time, when the value
+> does not exist yet, and substitutes an empty string without warning. Writing `$$` makes Compose
+> emit a literal `${INSTANCE_ID}` for Fluent Bit to resolve itself. Variables that Compose *should*
+> resolve, such as a Loki hostname coming from your `.env`, keep a single `$`.
 
 ## Development with Simulator
 
@@ -322,7 +339,7 @@ To exercise the instance file as well:
 
 ```bash
 export QUOTE_SIDECAR_INSTANCE_FILE__ENABLED=true
-export QUOTE_SIDECAR_INSTANCE_FILE__PATH=/tmp/dstack-test/instance.env
+export QUOTE_SIDECAR_INSTANCE_FILE__PATH=/tmp/dstack-test/instance.conf
 cargo run
 ```
 
@@ -340,8 +357,8 @@ curl "http://localhost:9999/attest?data=my-app-state"
 # Test info endpoint
 curl -s http://localhost:9999/info | jq -r .instance_id
 
-# Check the instance file is sourceable
-sh -c '. /tmp/dstack-test/instance.env && echo "$INSTANCE_ID / $APP_NAME"'
+# Check the instance file
+cat /tmp/dstack-test/instance.conf
 ```
 
 ## Development

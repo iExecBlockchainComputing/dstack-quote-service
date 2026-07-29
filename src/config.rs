@@ -17,14 +17,14 @@ pub struct ServerConfig {
 /// Configuration of the startup instance file.
 ///
 /// When enabled, the service queries the dstack guest agent once at startup and
-/// persists the CVM identity fields to a shell-sourceable `.env` file. Sidecars
-/// such as Fluent Bit can then label their records without needing their own
-/// access to the dstack socket.
+/// persists the CVM identity as a Fluent Bit configuration fragment. Fluent Bit
+/// picks it up through an `@INCLUDE` and can then label its records without
+/// needing its own access to the dstack socket.
 #[derive(Debug, Clone, Deserialize)]
 pub struct InstanceFileConfig {
     /// Whether the instance file is written at startup.
     pub enabled: bool,
-    /// Destination path of the `.env` file.
+    /// Destination path of the file.
     pub path: PathBuf,
     /// When true, failing to write the file aborts startup.
     pub required: bool,
@@ -40,7 +40,7 @@ impl Config {
             .set_default("server.host", "0.0.0.0")?
             .set_default("server.port", 9999)?
             .set_default("instance_file.enabled", false)?
-            .set_default("instance_file.path", "/shared/instance.env")?
+            .set_default("instance_file.path", "/shared/instance.conf")?
             .set_default("instance_file.required", true)?
             .set_default("instance_file.retries", 5)?
             .set_default("instance_file.retry_delay_ms", 2000)?

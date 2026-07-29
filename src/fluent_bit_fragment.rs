@@ -10,8 +10,8 @@
 //! distroless: with no shell in them, sourcing an `.env` file from an entrypoint
 //! override is not an option.
 //!
-//! The file is written before the HTTP listener is bound, so a successful
-//! `/health` response also guarantees that the file is present. Fluent Bit can
+//! The fragment is written before the HTTP listener is bound, so a successful
+//! `/health` response also guarantees that it is present. Fluent Bit can
 //! therefore wait on `depends_on: condition: service_healthy`.
 
 use std::ffi::OsString;
@@ -23,13 +23,13 @@ use tokio::fs;
 use tokio::time::{Duration, sleep};
 use tracing::warn;
 
-use crate::config::InstanceFileConfig;
+use crate::config::FluentBitFragmentConfig;
 
 /// Queries the dstack guest agent and persists the CVM identity to `cfg.path`.
 ///
 /// The file is written atomically, so a concurrent reader either sees the
 /// previous content or the complete new one, never a partial write.
-pub async fn write(client: &DstackClient, cfg: &InstanceFileConfig) -> Result<()> {
+pub async fn write(client: &DstackClient, cfg: &FluentBitFragmentConfig) -> Result<()> {
     let info = fetch_info(client, cfg).await?;
     let contents = render(&info)?;
     write_atomically(&cfg.path, &contents).await
@@ -39,9 +39,8 @@ pub async fn write(client: &DstackClient, cfg: &InstanceFileConfig) -> Result<()
 ///
 /// The socket may not be ready yet when the container starts, so the initial
 /// attempt is followed by up to `cfg.retries` additional ones.
-async fn fetch_info(client: &DstackClient, cfg: &InstanceFileConfig) -> Result<InfoResponse> {
-    let attempts = cfg.retries.saturating_add(1);
-    let mut attempt = 1;
+async fn fetch_info(client: &DstackClient, cfg: &FluentBitFragmentConfig) -> Result<InfoResponse> {
+    let mut retry = 0;
 
     loop {
         let err = match client.info().await {
@@ -49,23 +48,25 @@ async fn fetch_info(client: &DstackClient, cfg: &InstanceFileConfig) -> Result<I
             Err(err) => err,
         };
 
-        if attempt >= attempts {
+        if retry == cfg.retries {
             return Err(err).with_context(|| {
-                format!("Failed to query the dstack guest agent after {attempts} attempt(s)")
+                format!(
+                    "Failed to query the dstack guest agent, giving up after {} retries",
+                    cfg.retries
+                )
             });
         }
 
+        retry += 1;
         warn!(
-            "Failed to query the dstack guest agent (attempt {attempt}/{attempts}), \
-             retrying in {}ms: {err:#}",
-            cfg.retry_delay_ms
+            "Failed to query the dstack guest agent, retry {retry}/{} in {}ms: {err:#}",
+            cfg.retries, cfg.retry_delay_ms
         );
         sleep(Duration::from_millis(cfg.retry_delay_ms)).await;
-        attempt += 1;
     }
 }
 
-/// The identity fields exported to the instance file, in a stable order.
+/// The identity fields exported to the fragment, in a stable order.
 ///
 /// Only the fields useful as log labels are here. `app_cert` (a multi-kilobyte
 /// PEM blob) and `tcb_info` (a nested object) are deliberately left out; `GET
@@ -86,13 +87,21 @@ fn exported_fields(info: &InfoResponse) -> [(&'static str, &str); 4] {
 ///
 /// # Errors
 ///
-/// Returns an error if a value contains a newline. It would end the directive
-/// early and turn the remainder into a stray configuration line, which Fluent
-/// Bit either refuses to start on or, worse, interprets.
+/// Returns an error if a value is empty or contains a newline.
+///
+/// Fluent Bit does reject both on its own — an empty value fails the Loki output
+/// with `invalid key value pair`, and a newline turns the remainder into a stray
+/// configuration line — but it only notices at its own startup, in another
+/// container, with an error that does not name the guest agent. Failing here
+/// keeps the diagnosis where the cause is, and catches values that no Fluent Bit
+/// directive happens to reference.
 fn render(info: &InfoResponse) -> Result<String> {
     let mut rendered = String::new();
 
     for (key, value) in exported_fields(info) {
+        if value.is_empty() {
+            bail!("Guest agent returned an empty {key}");
+        }
         if value.contains('\n') {
             bail!("Guest agent returned a {key} containing a newline, which cannot be exported");
         }
@@ -118,7 +127,7 @@ async fn write_atomically(path: &Path, contents: &str) -> Result<()> {
 
     let file_name = path
         .file_name()
-        .ok_or_else(|| anyhow!("Instance file path {} has no file name", path.display()))?;
+        .ok_or_else(|| anyhow!("Fragment path {} has no file name", path.display()))?;
     let mut tmp_name = OsString::from(".");
     tmp_name.push(file_name);
     tmp_name.push(".tmp");
@@ -129,8 +138,14 @@ async fn write_atomically(path: &Path, contents: &str) -> Result<()> {
         .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
 
     if let Err(err) = fs::rename(&tmp_path, path).await {
-        // Best effort: never leave a stale temporary file behind for a sidecar to trip on.
-        let _ = fs::remove_file(&tmp_path).await;
+        // Clean up so no stale temporary file is left behind. A failure here is
+        // reported but must not mask the rename error, which is the actionable one.
+        if let Err(cleanup_err) = fs::remove_file(&tmp_path).await {
+            warn!(
+                "Failed to remove the temporary file {}: {cleanup_err}",
+                tmp_path.display()
+            );
+        }
         return Err(err).with_context(|| {
             format!(
                 "Failed to move {} to {}",
@@ -221,6 +236,15 @@ mod test {
         }
 
         #[test]
+        fn should_reject_an_empty_value() {
+            let info = info_fixture("", "app-1", "my-app", "hash-1");
+
+            let result = render(&info);
+
+            assert!(result.is_err(), "an empty value must not reach the file");
+        }
+
+        #[test]
         fn should_reject_a_value_containing_a_newline() {
             let info = info_fixture("i-1", "app-1", "evil\n@SET INSTANCE_ID=spoofed", "hash-1");
 
@@ -237,7 +261,7 @@ mod test {
 
             assert!(
                 !result.contains("BEGIN CERTIFICATE"),
-                "app_cert must never reach the instance file: {result}"
+                "app_cert must never reach the fragment: {result}"
             );
         }
     }

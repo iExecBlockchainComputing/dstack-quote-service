@@ -11,7 +11,7 @@ This service provides a REST API interface to the Dstack SDK, enabling easy inte
 - 🔐 **Quote Generation**: Generate TEE quotes with custom data
 - ✅ **Attestation**: Create attestation proofs for application state
 - 📊 **RTMR Replay**: Automatic replay of Runtime Measurement Registers from event logs
-- 🏷️ **Instance File**: Optionally persist the CVM identity at startup for sidecars to consume
+- 🏷️ **Fluent Bit Fragment**: Optionally persist the CVM identity at startup for log labelling
 - 🚀 **Fast & Lightweight**: Built with Axum for high-performance async operations
 - 📝 **JSON API**: Simple REST endpoints with JSON responses
 - 🔍 **Health Checks**: Built-in health monitoring endpoints
@@ -34,11 +34,10 @@ The service can be configured using environment variables. The naming scheme is
 |----------------------------------------------|---------------------------------------------------|-----------------------|
 | `QUOTE_SIDECAR_SERVER__HOST`                 | Server bind address                                | `0.0.0.0`             |
 | `QUOTE_SIDECAR_SERVER__PORT`                 | Server port                                        | `9999`                |
-| `QUOTE_SIDECAR_INSTANCE_FILE__ENABLED`       | Write the instance file at startup                 | `false`               |
-| `QUOTE_SIDECAR_INSTANCE_FILE__PATH`          | Destination of the instance file                   | `/shared/instance.conf`|
-| `QUOTE_SIDECAR_INSTANCE_FILE__REQUIRED`      | Abort startup if the instance file cannot be written | `true`              |
-| `QUOTE_SIDECAR_INSTANCE_FILE__RETRIES`       | Extra attempts to reach the guest agent            | `5`                   |
-| `QUOTE_SIDECAR_INSTANCE_FILE__RETRY_DELAY_MS`| Delay between two attempts, in milliseconds        | `2000`                |
+| `QUOTE_SIDECAR_FLUENT_BIT_FRAGMENT__GENERATE`| Write the Fluent Bit fragment at startup           | `false`               |
+| `QUOTE_SIDECAR_FLUENT_BIT_FRAGMENT__PATH`    | Destination of the fragment                        | `/shared/instance.conf`|
+| `QUOTE_SIDECAR_FLUENT_BIT_FRAGMENT__RETRIES` | Extra attempts to reach the guest agent            | `5`                   |
+| `QUOTE_SIDECAR_FLUENT_BIT_FRAGMENT__RETRY_DELAY_MS`| Delay between two attempts, in milliseconds  | `2000`                |
 
 ### Example
 
@@ -195,20 +194,20 @@ dstack-quote-sidecar/
 │   ├── application.rs    # Application setup and routing
 │   ├── config.rs         # Configuration management
 │   ├── handlers.rs       # HTTP request handlers
-│   └── instance_file.rs  # Startup persistence of the CVM identity
+│   └── fluent_bit_fragment.rs  # Startup persistence of the CVM identity
 ├── Cargo.toml            # Project dependencies
 └── README.md             # This file
 ```
 
-## Instance File
+## Fluent Bit Fragment
 
 Fluent Bit, running alongside this service inside the CVM, needs the dstack `instance_id` to
 label the records it forwards. Rather than giving it its own access to the dstack socket (which
 usually means an extra `curl` + `jq` init container), this service can persist the CVM identity
 once at startup.
 
-Enable it with `QUOTE_SIDECAR_INSTANCE_FILE__ENABLED=true`. The service queries the guest agent
-and writes a Fluent Bit configuration fragment:
+Turn it on with `QUOTE_SIDECAR_FLUENT_BIT_FRAGMENT__GENERATE=true`. The service queries the
+guest agent and writes a Fluent Bit configuration fragment:
 
 ```ini
 @SET INSTANCE_ID=...
@@ -224,25 +223,22 @@ their entrypoint to `source` a file is not possible.
 
 Properties worth knowing:
 
-- **Written before the listener is bound.** A healthy container therefore also means the file is
-  on disk, so consumers can simply wait on `condition: service_healthy`. The image ships a
+- **Written before the listener is bound.** A healthy container therefore also means the fragment
+  is on disk, so consumers can simply wait on `condition: service_healthy`. The image ships a
   `HEALTHCHECK` that polls `/health`.
-- **Atomic.** The file is written to a temporary path and renamed, so a reader never sees a
+- **Atomic.** The fragment is written to a temporary path and renamed, so a reader never sees a
   partial write.
-- **Retried.** The guest agent is queried up to `RETRIES + 1` times, spaced by `RETRY_DELAY_MS`.
-- **Fail-fast by default.** If the file cannot be written, startup aborts with a non-zero exit
-  code. This is what keeps the guarantee above meaningful: a healthy container always has a
-  fresh file.
+- **Retried.** The guest agent is queried once, then up to `RETRIES` more times, spaced by
+  `RETRY_DELAY_MS`.
+- **Fail-fast.** If the fragment cannot be written, startup aborts with a non-zero exit code.
+  That is what keeps the guarantee above meaningful, and it costs nothing: the dstack socket is
+  this service's only external dependency, so a guest agent that cannot be reached leaves
+  `/quote`, `/attest` and `/info` broken anyway. There is deliberately no opt-out.
 - Values are written bare, because `@SET` takes everything up to the end of the line literally.
-  A value containing a newline is rejected at write time rather than producing a stray
-  configuration line.
+  Empty values and values containing a newline are rejected at write time. Fluent Bit would
+  reject them too, but only at its own startup, in another container, with an error that does
+  not name the guest agent.
 - `app_cert` and `tcb_info` are deliberately **not** exported. Use `GET /info` for the full payload.
-
-> **Careful with `REQUIRED=false`.** It downgrades a write failure to a warning and lets the
-> service start, which breaks the healthy-implies-written guarantee in two ways: Fluent Bit
-> refuses to start on a missing `@INCLUDE` target, and if a file from a previous boot is still on
-> the volume it will silently label its records with a **stale** `instance_id`. Only use it when
-> serving quotes matters more than labelling logs correctly.
 
 ### Fluent Bit integration
 
@@ -253,8 +249,8 @@ services:
   dstack-quote-service:
     image: docker-regis.iex.ec/dstack-quote-service:<tag>
     environment:
-      QUOTE_SIDECAR_INSTANCE_FILE__ENABLED: "true"
-      QUOTE_SIDECAR_INSTANCE_FILE__PATH: /shared/instance.conf
+      QUOTE_SIDECAR_FLUENT_BIT_FRAGMENT__GENERATE: "true"
+      QUOTE_SIDECAR_FLUENT_BIT_FRAGMENT__PATH: /shared/instance.conf
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
       - shared:/shared
@@ -335,15 +331,15 @@ export DSTACK_SIMULATOR_ENDPOINT=http://localhost:8090
 cargo run
 ```
 
-To exercise the instance file as well:
+To exercise the Fluent Bit fragment as well:
 
 ```bash
-export QUOTE_SIDECAR_INSTANCE_FILE__ENABLED=true
-export QUOTE_SIDECAR_INSTANCE_FILE__PATH=/tmp/dstack-test/instance.conf
+export QUOTE_SIDECAR_FLUENT_BIT_FRAGMENT__GENERATE=true
+export QUOTE_SIDECAR_FLUENT_BIT_FRAGMENT__PATH=/tmp/dstack-test/instance.conf
 cargo run
 ```
 
-`Instance file written to ...` is logged before `Server bound to ...`.
+`Fluent Bit fragment written to ...` is logged before `Server bound to ...`.
 
 ### 5. Test the Endpoints
 
@@ -357,7 +353,7 @@ curl "http://localhost:9999/attest?data=my-app-state"
 # Test info endpoint
 curl -s http://localhost:9999/info | jq -r .instance_id
 
-# Check the instance file
+# Check the Fluent Bit fragment
 cat /tmp/dstack-test/instance.conf
 ```
 

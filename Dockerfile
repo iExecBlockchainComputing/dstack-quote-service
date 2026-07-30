@@ -16,5 +16,10 @@ WORKDIR /app
 # Copy the binary from builder stage
 COPY --from=builder /app/target/release/dstack-quote-service .
 
+# Readiness gate: the Fluent Bit fragment, when generated, is written before the
+# listener is bound, so a healthy container also means the fragment is on disk.
+HEALTHCHECK --interval=5s --timeout=3s --start-period=2s --retries=12 \
+    CMD wget -q -O /dev/null "http://127.0.0.1:${QUOTE_SIDECAR_SERVER__PORT:-9999}/health"
+
 # Run the application
 ENTRYPOINT ["/app/dstack-quote-service"]

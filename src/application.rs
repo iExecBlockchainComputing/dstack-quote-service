@@ -8,6 +8,7 @@ use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
+use crate::fluent_bit_fragment;
 use crate::handlers;
 
 #[derive(Clone)]
@@ -52,7 +53,29 @@ impl Application {
             .layer(cors)
     }
 
+    /// Writes the Fluent Bit fragment, when asked to, before the listener is bound.
+    ///
+    /// Doing it first means that a successful `/health` response also guarantees
+    /// the fragment is on disk, so consumers can simply wait for the container to
+    /// be healthy. A failure aborts startup, which keeps that guarantee true.
+    async fn write_fluent_bit_fragment(&self) -> Result<()> {
+        let cfg = &self.config.fluent_bit_fragment;
+        if !cfg.generate {
+            debug!("Fluent Bit fragment generation disabled, skipping");
+            return Ok(());
+        }
+
+        fluent_bit_fragment::write(&self.state.dstack_client, cfg)
+            .await
+            .context("Failed to write the Fluent Bit fragment")?;
+        info!("Fluent Bit fragment written to {}", cfg.path.display());
+
+        Ok(())
+    }
+
     pub async fn run(self) -> Result<()> {
+        self.write_fluent_bit_fragment().await?;
+
         let addr = self.config.bind_addr();
         let app = self.build_router();
         let listener = tokio::net::TcpListener::bind(&addr)

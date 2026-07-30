@@ -1,5 +1,6 @@
 pub mod application;
 pub mod config;
+pub mod fluent_bit_fragment;
 pub mod handlers;
 
 use tracing::{debug, error, info};

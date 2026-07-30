@@ -87,7 +87,7 @@ fn exported_fields(info: &InfoResponse) -> [(&'static str, &str); 4] {
 ///
 /// # Errors
 ///
-/// Returns an error if a value is empty or contains a newline.
+/// Returns an error if a value is blank or contains a newline.
 ///
 /// Fluent Bit does reject both on its own — an empty value fails the Loki output
 /// with `invalid key value pair`, and a newline turns the remainder into a stray
@@ -95,12 +95,16 @@ fn exported_fields(info: &InfoResponse) -> [(&'static str, &str); 4] {
 /// container, with an error that does not name the guest agent. Failing here
 /// keeps the diagnosis where the cause is, and catches values that no Fluent Bit
 /// directive happens to reference.
+///
+/// Blank values are rejected rather than trimmed: the guest agent is the source
+/// of truth, and silently rewriting what it returned would hide the anomaly. For
+/// the same reason non-blank values are written exactly as received.
 fn render(info: &InfoResponse) -> Result<String> {
     let mut rendered = String::new();
 
     for (key, value) in exported_fields(info) {
-        if value.is_empty() {
-            bail!("Guest agent returned an empty {key}");
+        if value.trim().is_empty() {
+            bail!("Guest agent returned a blank {key}");
         }
         if value.contains('\n') {
             bail!("Guest agent returned a {key} containing a newline, which cannot be exported");
@@ -242,6 +246,18 @@ mod test {
             let result = render(&info);
 
             assert!(result.is_err(), "an empty value must not reach the file");
+        }
+
+        #[test]
+        fn should_reject_a_whitespace_only_value() {
+            let info = info_fixture("   ", "app-1", "my-app", "hash-1");
+
+            let result = render(&info);
+
+            assert!(
+                result.is_err(),
+                "a whitespace-only value must not reach the file"
+            );
         }
 
         #[test]

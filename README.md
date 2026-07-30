@@ -257,6 +257,9 @@ services:
 
   fluent-bit:
     image: fluent/fluent-bit:<tag>
+    # Required: Fluent Bit exits on a missing @INCLUDE and Docker will not
+    # restart it on its own. See the note below.
+    restart: unless-stopped
     depends_on:
       dstack-quote-service:
         condition: service_healthy
@@ -281,9 +284,13 @@ volumes:
 ```
 
 Fluent Bit refuses to start if the `@INCLUDE` target is missing, which is the behaviour you want:
-combined with `condition: service_healthy` it enforces ordering at `compose up`, and if the
-daemon restarts containers out of order (after a host reboot, say) Fluent Bit simply retries
-until the file is there rather than shipping unlabelled records.
+it can never ship unlabelled records. At `compose up`, `condition: service_healthy` already
+guarantees the fragment is there. Outside of that — a host reboot, where the daemon brings
+containers back in its own order — Fluent Bit may well start first and exit.
+
+**`restart: unless-stopped` on the Fluent Bit service is therefore not optional.** Docker does
+not restart a container that exits unless a restart policy says so; without one, a reboot in the
+wrong order leaves Fluent Bit permanently down. With one, it retries until the fragment appears.
 
 > **If the configuration lives in a compose `configs: content:` block, escape the variable as
 > `$${INSTANCE_ID}`.** Compose interpolates `${...}` in that block at `up` time, when the value

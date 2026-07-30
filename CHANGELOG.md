@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/iExec-Nox/dstack-quote-service/compare/v0.1.1...v0.2.0) (2026-07-30)
+
+
+### Features
+
+* **instance-file:** persist CVM identity at startup  ([#12](https://github.com/iExec-Nox/dstack-quote-service/issues/12)) ([32cd76f](https://github.com/iExec-Nox/dstack-quote-service/commit/32cd76f7bd873d948616d394e30825ead0ebc8c3))
+
 ## [0.1.1](https://github.com/iExec-Nox/dstack-quote-service/compare/v0.1.0...v0.1.1) (2026-07-03)
 
 
